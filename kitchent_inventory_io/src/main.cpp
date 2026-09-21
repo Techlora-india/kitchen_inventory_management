@@ -1,9 +1,8 @@
 // ============================================================================
-//  Kitchen Inventory Scale v16.0
-//  - Button: short press → tare, long press (10 s) → AP mode
-//  - WiFi on demand, fast reconnect, wake-counter heartbeat
-//  - Correct baseline comparison on unstable settling
-//  - Persistent retry across deep sleep (RTC flag)
+//  Smart IoT Jar – v18.0
+//  - Single press → OTA check, Double tap → tare calibration, Long hold → AP
+//  - Boot ack sent on cold boot only
+//  - WiFi on demand, wake-counter heartbeat, calibrated battery
 // ============================================================================
 
 #include <Arduino.h>
@@ -18,29 +17,20 @@
 #include <time.h>
 #include <esp_sleep.h>
 #include "firebase_credentials.h"
+#include "OtaService.h"
 
-#include "OtaService.h"  // For OTA update checking and boot acknowledgment
-
-const int CURRENT_VERSION = 0;
-const char* versionUrl = "https://raw.githubusercontent.com/Techlora-india/kitchen_inventory_management/83bb2c4616f2f022d1729405eda17db1be59c41e/kitchent_inventory_io/var.txt";
-const char* firmwareUrl = "https://raw.githubusercontent.com/Techlora-india/kitchen_inventory_management/83bb2c4616f2f022d1729405eda17db1be59c41e/kitchent_inventory_io/.pio/build/seeed_xiao_esp32c3/firmware.bin";
-const char* deviceId = "kim-001";
-
+// ===================== OTA CONFIGURATION =====================
+const int CURRENT_VERSION = 1;
+const char* versionUrl =
+    "https://raw.githubusercontent.com/Techlora-india/kitchen_inventory_management/main/kitchent_inventory_io/var.txt";
+const char* firmwareUrl =
+    "https://raw.githubusercontent.com/Techlora-india/kitchen_inventory_management/main/kitchent_inventory_io/.pio/build/seeed_xiao_esp32c3/firmware.bin";
 const char* firebaseBootAckBaseUrl = nullptr;
-// Optional database secret/token if your DB rules require auth.
-// Leave empty string if your rules allow write for this specific path.
 const char* firebaseAuthToken = "";
 
-const OtaConfig otaConfig = {
-	CURRENT_VERSION,
-	versionUrl,
-	firmwareUrl,
-	deviceId,
-	firebaseBootAckBaseUrl,
-	firebaseAuthToken,
-};
-
-
+// Populated at runtime after deviceId is loaded from NVM.
+// Do NOT initialize with deviceId here — String would be captured empty.
+OtaConfig otaConfig;
 
 // ===================== HARDWARE PINS =====================
 #define LOADCELL_DOUT_PIN  D4
@@ -66,10 +56,11 @@ const float    BATTERY_CRITICAL_THRESHOLD_MV = 3200.0f;
 const uint32_t INITIAL_RETRY_INTERVAL_MS     = 60000;
 const uint32_t MAX_RETRY_INTERVAL_MS         = 3600000;
 const uint32_t LONG_PRESS_MS                 = 10000;
-const uint32_t AP_CONNECT_TIMEOUT_MS         = 10000;
+const uint32_t AP_CONNECT_TIMEOUT_MS         = 20000;
 const uint32_t AP_EXIT_DELAY_MS              = 5000;
 const uint32_t NTP_RESYNC_INTERVAL_SEC       = 86400;
 const uint32_t BUTTON_RELEASE_TIMEOUT_MS     = 30000;
+const uint32_t DOUBLE_TAP_WINDOW_MS          = 1000;
 
 // ===================== NTP =====================
 const char* NTP_SERVERS[] = {"pool.ntp.org", "time.google.com"};
@@ -100,7 +91,7 @@ enum class MasterState : uint8_t {
 };
 enum class WiFiState   : uint8_t { IDLE, ATTEMPTING, CONNECTED, AP_ACTIVE };
 enum class LEDMode     : uint8_t { OFF, SOLID, BLINK_FAST, BLINK_SLOW, PULSE_LOW_BATTERY };
-enum class ButtonEvent : uint8_t { NONE, SHORT_PRESS, LONG_PRESS };
+enum class ButtonEvent : uint8_t { NONE, SHORT_PRESS, DOUBLE_PRESS, LONG_PRESS };
 enum class SendReason  : uint8_t { WEIGHT_CHANGE, HEARTBEAT, CALIBRATED, BOOT };
 
 // ===================== OBJECTS =====================
@@ -132,6 +123,7 @@ float currentTareOffset = FACTORY_TARE_OFFSET;
 
 bool calibrating   = false;
 bool setupComplete = false;
+bool isColdBoot    = false;
 
 float weightBuffer[10];
 uint8_t weightBufferIdx = 0, weightBufferCount = 0;
@@ -200,6 +192,7 @@ bool   connectWiFiIfNeeded();
 ButtonEvent checkTareButtonEvent();
 ButtonEvent waitForButtonRelease();
 void   performTareCalibration();
+void   performOtaCheck();
 void   enterProvisioningMode();
 float  readBatteryVoltage();
 void   sendHeartbeatIfDue();
@@ -207,12 +200,52 @@ String htmlEscape(const String& s);
 String reasonToString(SendReason r);
 void   handlePendingButton();
 void   printIST(const char* prefix);
+void   initOtaConfig();
+void   sendBootAckIfColdBoot();
+void   runOtaCheckSafely();
+
+// ===================== OTA HELPERS =====================
+void initOtaConfig() {
+    // Field order MUST match OtaConfig struct in OtaService.h.
+    // deviceId is String → cast to const char* for the struct field.
+    otaConfig = OtaConfig{
+        CURRENT_VERSION,
+        versionUrl,
+        firmwareUrl,
+        deviceId.c_str(),          // ← FIX: String → const char*
+        firebaseBootAckBaseUrl,
+        firebaseAuthToken,
+    };
+}
+
+void sendBootAckIfColdBoot() {
+    if (!isColdBoot) return;
+    Serial.println("[OTA] Cold boot — sending boot ack");
+
+    StaticJsonDocument<192> doc;
+    doc["deviceId"]  = deviceId;
+    doc["version"]   = CURRENT_VERSION;
+    doc["bootCount"] = boot_count;
+    doc["reason"]    = "cold_boot";
+
+    // FIX: pass the JsonDocument directly, not a serialized String.
+    initOtaConfig();
+    send_ota_ack(otaConfig, doc);
+}
+
+void runOtaCheckSafely() {
+    Serial.println("[OTA] Checking for firmware updates...");
+    initOtaConfig();
+    check_ota(otaConfig);
+    // If an update is found, check_ota() typically reboots the device.
+    // If no update, execution continues normally.
+}
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(100);
-    Serial.println("\n\n=== KITCHEN SCALE v16.0 ===\n");
+    Serial.println("\n\n=== SMART IOT JAR v18.0 ===\n");
 
     if (magic_check != MEMORY_MAGIC_NUMBER) {
         magic_check = MEMORY_MAGIC_NUMBER;
@@ -223,9 +256,11 @@ void setup() {
         rtc_fallback_ts = 1735689600;
         rtc_last_send_boot = 0;
         rtc_cloud_pending = 0;
+        isColdBoot = true;
         Serial.println("--- Cold boot ---");
     } else {
         boot_count++;
+        isColdBoot = false;
         Serial.printf("--- Wake #%u ---\n", boot_count);
     }
 
@@ -234,15 +269,18 @@ void setup() {
     pinMode(PIN_HX711_POWER, OUTPUT); powerHX711(false);
     pinMode(PIN_TARE_BUTTON, INPUT_PULLUP);
 
-    // ── Handle wake from button IMMEDIATELY ──
+    // ── Handle wake from button immediately ──
     esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
     if (wake == ESP_SLEEP_WAKEUP_GPIO) {
         Serial.println("[WAKE] button");
         delay(50);
         if (digitalRead(PIN_TARE_BUTTON) == LOW) {
             pendingButtonEvent = waitForButtonRelease();
-            Serial.printf("[BTN] wake event: %s\n",
-                pendingButtonEvent == ButtonEvent::LONG_PRESS ? "LONG" : "SHORT");
+            const char* name =
+                (pendingButtonEvent == ButtonEvent::LONG_PRESS)   ? "LONG"   :
+                (pendingButtonEvent == ButtonEvent::DOUBLE_PRESS) ? "DOUBLE" :
+                (pendingButtonEvent == ButtonEvent::SHORT_PRESS)  ? "SHORT"  : "NONE";
+            Serial.printf("[BTN] wake event: %s\n", name);
         } else {
             Serial.println("[BTN] already released - ignoring");
         }
@@ -307,6 +345,9 @@ void setup() {
     lastBatteryReadTime = millis();
     lastStableTime = millis();
 
+    // ── Boot ack on cold boot ──
+    sendBootAckIfColdBoot();
+
     Serial.println("[✓] Setup done.");
 
     if (setupComplete && pendingButtonEvent != ButtonEvent::NONE) {
@@ -359,8 +400,9 @@ void loop() {
 
     if (!calibrating && !apConnecting && !apExitPending) {
         ButtonEvent ev = checkTareButtonEvent();
-        if (ev == ButtonEvent::SHORT_PRESS) { performTareCalibration(); return; }
-        if (ev == ButtonEvent::LONG_PRESS)  { enterProvisioningMode();  return; }
+        if (ev == ButtonEvent::SHORT_PRESS)  { performOtaCheck();       return; }
+        if (ev == ButtonEvent::DOUBLE_PRESS) { performTareCalibration(); return; }
+        if (ev == ButtonEvent::LONG_PRESS)   { enterProvisioningMode();  return; }
     }
 
     if (now - lastLoopTime >= 100) {
@@ -411,6 +453,9 @@ void handlePendingButton() {
     pendingButtonEvent = ButtonEvent::NONE;
 
     if (ev == ButtonEvent::SHORT_PRESS) {
+        Serial.println("[BTN] → OTA check");
+        performOtaCheck();
+    } else if (ev == ButtonEvent::DOUBLE_PRESS) {
         Serial.println("[BTN] → tare calibration");
         performTareCalibration();
     } else if (ev == ButtonEvent::LONG_PRESS) {
@@ -638,7 +683,6 @@ void processUnstableWeight(float startW) {
 
     currentState = MasterState::STABLE;
 
-    // FIX: compare against original baseline, not startW
     float delta = finalW - lastStableWeight;
     Serial.printf("[UNSTABLE] baseline %.2f → final %.2f, Δ %.2f g\n",
                   lastStableWeight, finalW, delta);
@@ -896,7 +940,7 @@ void handleRoot() {
     String html = R"HTML(<!DOCTYPE html><html><head>
 <meta charset='UTF-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Kitchen Scale</title>
+<title>Smart Jar</title>
 <style>
   :root{font-family:system-ui,-apple-system,sans-serif}
   body{margin:0;padding:24px;background:#f4f6f8;color:#222}
@@ -1085,59 +1129,108 @@ void handleConfig() {
 
 // ===================== BUTTON STATE MACHINE =====================
 ButtonEvent checkTareButtonEvent() {
-    static bool rawLast = false, stableLast = false;
-    static uint32_t lastRawChange = 0, pressStart = 0;
-    static bool longFired = false;
+    static uint8_t  state = 0;      // 0=IDLE, 1=PRESSED, 2=WAIT_SECOND
+    static uint32_t stateTime = 0;
+    static bool     lastStable = false;
+    static bool     rawLast = false;
+    static uint32_t lastRawChange = 0;
+
     const uint32_t DEBOUNCE_MS = 50;
 
     bool raw = (digitalRead(PIN_TARE_BUTTON) == LOW);
     uint32_t now = millis();
 
     if (raw != rawLast) { lastRawChange = now; rawLast = raw; }
+    if ((now - lastRawChange) < DEBOUNCE_MS) return ButtonEvent::NONE;
 
-    if ((now - lastRawChange) >= DEBOUNCE_MS) {
-        if (raw != stableLast) {
-            stableLast = raw;
-            if (stableLast) { pressStart = now; longFired = false; }
-            else {
-                if (!longFired) return ButtonEvent::SHORT_PRESS;
-                longFired = false;
-            }
+    if (raw == lastStable) {
+        if (state == 1 && (now - stateTime) >= LONG_PRESS_MS) {
+            state = 0;
+            return ButtonEvent::LONG_PRESS;
         }
+        if (state == 2 && (now - stateTime) >= DOUBLE_TAP_WINDOW_MS) {
+            state = 0;
+            return ButtonEvent::SHORT_PRESS;
+        }
+        return ButtonEvent::NONE;
     }
 
-    if (stableLast && !longFired && (now - pressStart) >= LONG_PRESS_MS) {
-        longFired = true;
-        return ButtonEvent::LONG_PRESS;
+    lastStable = raw;
+    if (raw) {
+        if (state == 2) {
+            state = 0;
+            return ButtonEvent::DOUBLE_PRESS;
+        }
+        state = 1;
+        stateTime = now;
+    } else {
+        if (state == 1) {
+            state = 2;
+            stateTime = now;
+        }
     }
     return ButtonEvent::NONE;
 }
 
 ButtonEvent waitForButtonRelease() {
     uint32_t start = millis();
-    bool longReported = false;
+
+    // Phase 1: wait for release or long-hold
     while (digitalRead(PIN_TARE_BUTTON) == LOW) {
         uint32_t held = millis() - start;
-        if (!longReported && held >= LONG_PRESS_MS) {
+        if (held >= LONG_PRESS_MS) {
+            Serial.printf("[BTN] long press at %u ms\n", held);
             digitalWrite(PIN_LED, LOW);
-            Serial.printf("[BTN] long press fired at %u ms (no release yet)\n", held);
             return ButtonEvent::LONG_PRESS;
         }
         digitalWrite(PIN_LED, ((millis() / 150) % 2) ? HIGH : LOW);
         if (held > BUTTON_RELEASE_TIMEOUT_MS) {
-            Serial.println("[BTN] release timeout — SHORT");
+            Serial.println("[BTN] timeout → SHORT");
             digitalWrite(PIN_LED, LOW);
             return ButtonEvent::SHORT_PRESS;
         }
         delay(20);
     }
+
+    // Phase 2: first press released — wait for second press
+    uint32_t releasedAt = millis();
+    Serial.printf("[BTN] released after %u ms, waiting for double\n", releasedAt - start);
+
+    while (millis() - releasedAt < DOUBLE_TAP_WINDOW_MS) {
+        if (digitalRead(PIN_TARE_BUTTON) == LOW) {
+            Serial.println("[BTN] double tap confirmed");
+            uint32_t secondStart = millis();
+            while (digitalRead(PIN_TARE_BUTTON) == LOW &&
+                   (millis() - secondStart) < LONG_PRESS_MS) {
+                delay(20);
+            }
+            digitalWrite(PIN_LED, LOW);
+            return ButtonEvent::DOUBLE_PRESS;
+        }
+        delay(20);
+    }
+
     digitalWrite(PIN_LED, LOW);
-    uint32_t held = millis() - start;
-    Serial.printf("[BTN] released after %u ms → SHORT\n", held);
+    Serial.println("[BTN] single tap");
     return ButtonEvent::SHORT_PRESS;
 }
 
-// ===================== TARE =====================
+// ===================== OTA CHECK (SINGLE PRESS) =====================
+void performOtaCheck() {
+    Serial.println("[OTA] Manual check triggered");
+    if (!deviceConfigured || deviceId.length() == 0) {
+        Serial.println("[OTA] device not configured, skipping");
+        return;
+    }
+    if (!connectWiFiIfNeeded()) {
+        Serial.println("[OTA] WiFi unavailable, aborting");
+        return;
+    }
+    runOtaCheckSafely();   // reboots if an update is found
+    powerDownWiFi();       // reached only if no update
+}
+
+// ===================== TARE (DOUBLE TAP) =====================
 void performTareCalibration() {
     Serial.println("[CAL] start, settling 10 s...");
     calibrating = true;

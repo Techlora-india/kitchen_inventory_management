@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Smart Jar Dashboard</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Kitchen Inventory</p>
+          <h1>Smart Jar Dashboard</h1>
+        </div>
+        <div class="live-pill" id="livePill">
+          <span class="dot"></span>
+          <span>Live</span>
+        </div>
+      </header>
+
+      <main class="dashboard">
+        <section class="toolbar card">
+          <label for="deviceSelect">Device</label>
+          <div class="select-row">
+            <select id="deviceSelect" aria-label="Select device"></select>
+            <button id="refreshBtn" type="button">Refresh</button>
+          </div>
+        </section>
+
+        <section class="stats-grid">
+          <article class="card metric weight-card">
+            <div class="metric-header">
+              <span class="label">Live Weight</span>
+              <span id="statusBadge" class="status-badge">-</span>
+            </div>
+            <div class="metric-value" id="liveWeight">-- g</div>
+            <div class="metric-foot">Updated <span id="lastUpdated">--</span></div>
+          </article>
+
+          <article class="card metric">
+            <div class="metric-header">
+              <span class="label">Battery</span>
+              <span id="batteryState" class="status-badge neutral">-</span>
+            </div>
+            <div class="battery-wrap">
+              <div class="battery-shell">
+                <div id="batteryFill" class="battery-fill"></div>
+              </div>
+              <div class="battery-value" id="batteryValue">-- %</div>
+            </div>
+            <div class="metric-foot" id="batteryVoltageText">-- mV / 4200 mV</div>
+          </article>
+
+          <article class="card metric">
+            <div class="metric-header">
+              <span class="label">Heartbeat</span>
+            </div>
+            <div class="metric-value small" id="heartbeatValue">--</div>
+            <div class="metric-foot">Interval</div>
+          </article>
+
+          <article class="card metric">
+            <div class="metric-header">
+              <span class="label">History</span>
+            </div>
+            <div class="metric-value small" id="historyCount">0 points</div>
+            <div class="metric-foot">Last 24h data</div>
+          </article>
+        </section>
+
+        <section class="panel-grid">
+          <article class="card chart-card">
+            <div class="section-header">
+              <h2>Weight trend</h2>
+            </div>
+            <canvas id="historyChart" width="800" height="260"></canvas>
+          </article>
+
+          <article class="card table-card">
+            <div class="section-header">
+              <h2>Recent history</h2>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Weight</th>
+                  </tr>
+                </thead>
+                <tbody id="historyTableBody">
+                  <tr>
+                    <td colspan="2" class="empty-state">No data yet</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
